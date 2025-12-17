@@ -71,8 +71,26 @@ def write_ground_truth(
     confounders,
     row_counter: RowCounter,
     seed: int,
+    tso_stats: tso_calls.TSOStats,
 ) -> None:
     gt_path = os.path.join(output_dir, "ground_truth.json")
+    noise_counts = {k: tso_stats.noise_counts.get(k, 0) for k in ["clean", "missing", "fabricated", "wrong_customer"]}
+    total_calls = max(1, tso_stats.rows)
+    tso_noise = {
+        "total_calls": tso_stats.rows,
+        "noise_counts": noise_counts,
+        "noise_rates": {k: round(v / total_calls, 4) for k, v in noise_counts.items()},
+        "call_details": [
+            {
+                "call_id": rec.call_id,
+                "true_transaction_id": rec.true_transaction_id,
+                "emitted_transaction_id": rec.emitted_transaction_id,
+                "noise_type": rec.noise_type,
+                "delay_minutes": rec.delay_minutes,
+            }
+            for rec in tso_stats.call_records
+        ],
+    }
     data = {
         "dataset_name": DATASET_NAME,
         "time_range": {"start": isoformat(START_TS), "end": isoformat(END_TS)},
@@ -108,6 +126,7 @@ def write_ground_truth(
                 "dependency_latency_multiplier": [5, 12],
             },
         },
+        "tso_noise": tso_noise,
     }
     with open(gt_path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
@@ -315,7 +334,7 @@ def main() -> None:
         fh.write(validation_summary)
 
     write_dataset_readme(config.output_dir)
-    write_ground_truth(config.output_dir, incident, confounders, row_counter, config.seed)
+    write_ground_truth(config.output_dir, incident, confounders, row_counter, config.seed, tso_stats)
 
     if config.zip_output:
         package_zip(config.output_dir)

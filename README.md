@@ -33,6 +33,26 @@ Example quick sanity run:
 python generate_dataset.py --output_dir out --app_log_rows 50000 --scale_logs 0.001 --seed 1 --no-zip
 ```
 
+## Regeneration and ClickHouse loading
+
+Use `scripts-dev/regen_fibersqs.sh` to regenerate the dataset, drop only the Fiber SQS tables in ClickHouse, load the CSVs, and emit a `postload_validation.json` report. Defaults target the local ClickHouse HTTP endpoint at `http://localhost:8123` with `default` credentials.
+
+Example:
+```bash
+./scripts-dev/regen_fibersqs.sh \
+  --output_dir /tmp/fibersqs \
+  --app_log_rows 7500000 \
+  --scale_logs 0.01 \
+  --seed 11 \
+  --no-zip
+```
+
+Key behaviors:
+- Deletes the specified output directory before regeneration.
+- Drops only the dataset tables: `fibersqs_app_logs`, `infra_host_metrics`, `network_circuit_metrics`, `trace_spans`, `tso_calls`.
+- Invokes the generator with boolean flags (`--zip` / `--no-zip`).
+- Loads CSVs via `scripts/load_csv_into_clickhouse.sh` and saves ClickHouse validation results to `postload_validation.json` in the output directory.
+
 The generator writes a validation summary (`validation_summary.json`) confirming referential integrity, incident coherence, confounder separability, and alert confusion-matrix counts.
 
 ## Project Structure
