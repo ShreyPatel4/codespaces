@@ -1,0 +1,64 @@
+{
+  "dataset_name": "simulated_fibersqs_cross_region_latency_tso",
+  "time_range": {
+    "start": "2025-12-01T00:00:00.000000Z",
+    "end": "2025-12-08T00:00:00.000000Z"
+  },
+  "primary_incident": {
+    "root_cause_type": "network",
+    "circuit_id": "CKT-CEN-EAS-003",
+    "src_region": "central",
+    "dst_region": "east",
+    "start": "2025-12-03T12:20:00.000000Z",
+    "end": "2025-12-05T18:10:00.000000Z",
+    "fix_time": "2025-12-05T18:15:00.000000Z",
+    "affected_transaction_types": [
+      "provision_fiber_sqs",
+      "modify_service_profile"
+    ]
+  },
+  "confounders": [
+    {
+      "name": "central_cpu_spike",
+      "start": "2025-12-02T09:30:00.000000Z",
+      "end": "2025-12-02T11:00:00.000000Z",
+      "component": "infra",
+      "region": "central",
+      "description": "Short CPU saturation on central hosts"
+    },
+    {
+      "name": "west_deployment_blip",
+      "start": "2025-12-04T17:00:00.000000Z",
+      "end": "2025-12-04T18:00:00.000000Z",
+      "component": "app",
+      "region": "west",
+      "description": "Deployment-induced latency bump in west"
+    }
+  ],
+  "generation": {
+    "seed": 1,
+    "row_counts": {
+      "fibersqs_app_logs": 2691,
+      "trace_spans": 1623,
+      "tso_calls": 9,
+      "network_circuit_metrics": 70560,
+      "infra_host_metrics": 72576
+    },
+    "parameters": {
+      "incident_burst_interval_minutes": 20,
+      "incident_burst_duration_minutes": [
+        4,
+        7
+      ],
+      "network_baseline_rtt_ms": 18,
+      "network_burst_rtt_range_ms": [
+        120,
+        350
+      ],
+      "dependency_latency_multiplier": [
+        5,
+        12
+      ]
+    }
+  }
+}

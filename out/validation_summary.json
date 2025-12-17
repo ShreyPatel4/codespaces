@@ -1,0 +1,16 @@
+{
+  "referential_integrity": {
+    "tso_match_pct": 100.0,
+    "trace_match_pct": 100.0
+  },
+  "incident_coherence": {
+    "dependency_latency_multiplier": 6.93,
+    "timeout_rate_multiplier": 7.69,
+    "network_rtt_multiplier": 17.09
+  },
+  "confounder_separability": {
+    "cpu_peak_pct": 96.84,
+    "network_peak_during_cpu": 1.0
+  },
+  "alert_quality": {}
+}

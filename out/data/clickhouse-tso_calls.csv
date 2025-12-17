@@ -1,0 +1,10 @@
+call_id,timestamp,customer_id,customer_region,issue_category,issue_description,service_type,transaction_id,resolution_time_minutes,escalated,resolution_code
+TSO-20251206162009890,2025-12-06T16:20:09Z,CUST-10556255,west,timeout,TSO call referencing long queue,fiber_sqs,TX-20251206151008-0000229,134,false,system_resolved
+TSO-20251202045453982,2025-12-02T04:54:53Z,CUST-72142961,central,timeout,reported stalled order,fiber_sqs,TX-20251202033253-0000270,168,false,system_resolved
+TSO-20251203200238841,2025-12-03T20:02:38Z,CUST-69719517,central,failure,timeout observed during modify,fiber_internet,TX-20251203191238-0000291,115,false,system_resolved
+TSO-20251205210322972,2025-12-05T21:03:22Z,CUST-78716782,central,slow_provisioning,TSO call referencing long queue,fiber_sqs,TX-20251205192222-0000329,14,false,customer_callback
+TSO-20251206155228173,2025-12-06T15:52:28Z,CUST-38121217,central,failure,customer claims service stuck,fiber_sqs,TX-20251206151528-0000333,56,false,customer_callback
+TSO-20251207205344432,2025-12-07T20:53:44Z,CUST-17493390,east,slow_provisioning,customer claims service stuck,fiber_internet,TX-20251207192343-0000394,42,false,system_resolved
+TSO-20251205021453369,2025-12-05T02:14:53Z,CUST-39409191,central,slow_provisioning,customer claims service stuck,fiber_sqs,TX-20251205012251-0000445,94,true,manual_intervention
+TSO-20251201143622177,2025-12-01T14:36:22Z,CUST-89400592,central,failure,TSO call referencing long queue,fiber_sqs,TX-20251201135822-0000451,129,false,customer_callback
+TSO-20251202053933215,2025-12-02T05:39:33Z,CUST-26046346,central,slow_provisioning,customer experiencing slow provisioning,fiber_sqs,TX-20251202051533-0000465,170,false,system_resolved
