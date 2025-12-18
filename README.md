@@ -50,14 +50,14 @@ Example:
 
 Key behaviors:
 - Deletes the specified output directory before regeneration.
-- Creates canonical storage in ClickHouse under `fibersqs_prod.*` before ingestion (MergeTree tables).
-- Loads CSVs into canonical tables using `scripts/load_csv_into_clickhouse.sh` in insert-only mode.
+- Creates canonical storage in ClickHouse under `fibersqs_prod.*` before ingestion (MergeTree tables) and preflights the sanitized `CLICKHOUSE_URL` (query string stripped, trailing slash trimmed) via `GET /ping`.
+- Loads CSVs into canonical tables using `scripts/load_csv_into_clickhouse.sh` in insert-only mode (HTTP POST with `--data-binary`).
 - Creates compatibility views for old table names (`fibersqs_app_logs`, `trace_spans`, `network_circuit_metrics`, `infra_host_metrics`, `tso_calls`) in `logs` database if it exists, otherwise in `default`.
-- Creates ES-style “index pattern” views in `fibersqs_prod`:
-  - Region views: `fibersqs_prod.\`fibersqs-prod-<region>-app-logs\``
-  - Daily views (last 7 days): `fibersqs_prod.\`fibersqs-prod-<region>-app-logs-YYYYMMDD\``
+- Creates ES-style “index pattern” views in `fibersqs_prod` against the compatibility app logs:
+  - Region views: `fibersqs_prod.fibersqs_prod_<region>_app_logs`
+  - Daily views (one per generated day): `fibersqs_prod.fibersqs_prod_<region>_app_logs_<YYYYMMDD>`
 - Invokes the generator with boolean flags (`--zip` / `--no-zip`).
-- Saves ClickHouse validation results to `postload_validation.json` in the output directory (including TSO TP/FN/FP/Wrong-link counts + rates).
+- Saves ClickHouse validation results to `postload_validation.json` in the output directory (including TSO TP/FN/FP/Wrong-link counts + rates, min/max day span, and view counts).
 
 The generator writes a validation summary (`validation_summary.json`) confirming referential integrity, incident coherence, and confounder separability.
 
@@ -82,6 +82,8 @@ The generator writes a validation summary (`validation_summary.json`) confirming
 
 Canonical tables live in the `fibersqs_prod` database. Existing queries using legacy names keep working via compatibility views.
 
+Index-pattern-style views are exposed via `SHOW TABLES FROM fibersqs_prod LIKE 'fibersqs_prod_%_app_logs%'`. Region-level views match `fibersqs_prod.fibersqs_prod_<region>_app_logs`, while daily shards use `fibersqs_prod.fibersqs_prod_<region>_app_logs_<YYYYMMDD>` and cover the full generated date span.
+
 Example: query canonical app logs directly:
 ```sql
 SELECT
@@ -99,10 +101,12 @@ Example: query an ES-style daily view:
 SELECT
   quantileTDigest(0.95)(end_to_end_latency_ms_f64) AS p95_ms,
   round(countIf(event='timeout')/count(), 4) AS timeout_rate
-FROM fibersqs_prod.`fibersqs-prod-central-app-logs-20251204`
+FROM fibersqs_prod.fibersqs_prod_central_app_logs_20251204
 WHERE event IN ('completed','timeout')
   AND transaction_type IN ('provision_fiber_sqs','modify_service_profile');
 ```
+
+In Grafana or ClickHouse notebooks, use `fibersqs_prod.fibersqs_prod_<region>_app_logs` for region slices or the daily suffixed views for time-bounded investigations; `SHOW TABLES LIKE 'fibersqs_prod_%_app_logs%'` lists the available shards. Regeneration is deterministic for a given `--seed`, preserving the 2025-12-01 through 2025-12-08 window and the Central-only incident even as you scale row counts.
 
 Example: TSO correlation confusion matrix (post-load computable in SQL):
 ```sql
