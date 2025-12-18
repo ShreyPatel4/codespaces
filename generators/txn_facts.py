@@ -12,6 +12,7 @@ from utils import (
     diurnal_factor,
     generate_incident_bursts,
     in_any_window,
+    isoformat,
     minutes_between,
     START_TS,
     END_TS,
@@ -35,9 +36,21 @@ SERVICE_TYPE_MAP = {
     "firmware_update": "fiber_internet",
     "service_health_check": "fiber_sqs",
 }
-REGION_WEIGHTS = {"central": 0.45, "east": 0.35, "west": 0.20}
+REGIONS = ["east", "west", "central", "north", "south"]
+REGION_WEIGHTS = {"central": 0.35, "east": 0.25, "west": 0.20, "north": 0.10, "south": 0.10}
 SERVICES_CHAIN = ["api", "orchestrator", "worker"]
 DEPENDENCY_SERVICE = "inventory-client"
+TXN_FACT_HEADERS = [
+    "transaction_id",
+    "customer_id",
+    "origin_region",
+    "txn_type",
+    "start_ts",
+    "end_ts",
+    "success",
+    "error_code",
+    "end_to_end_latency_ms",
+]
 
 
 @dataclass
@@ -71,6 +84,20 @@ class TransactionFact:
     @property
     def attempt_count(self) -> int:
         return max(1, self.retry_count + 1)
+
+
+def txn_fact_row(fact: "TransactionFact") -> List[object]:
+    return [
+        fact.transaction_id,
+        fact.customer_id,
+        fact.region,
+        fact.transaction_type,
+        isoformat(fact.start_ts),
+        isoformat(fact.end_ts),
+        "true" if fact.final_status != "timeout" else "false",
+        fact.error_code or "",
+        round(fact.end_to_end_latency_ms, 2),
+    ]
 
 
 class TransactionFactStream:
@@ -130,7 +157,8 @@ class TransactionFactStream:
     def _select_region(self) -> str:
         r = self.rng.random()
         cumulative = 0.0
-        for region, weight in REGION_WEIGHTS.items():
+        for region in REGIONS:
+            weight = REGION_WEIGHTS.get(region, 0.0)
             cumulative += weight
             if r <= cumulative:
                 return region
@@ -291,8 +319,8 @@ def default_confounders() -> List[ConfounderWindow]:
         ),
         ConfounderWindow(
             name="west_deployment_blip",
-            start=datetime(2025, 12, 4, 17, 0, tzinfo=START_TS.tzinfo),
-            end=datetime(2025, 12, 4, 18, 0, tzinfo=START_TS.tzinfo),
+            start=datetime(2025, 12, 6, 17, 0, tzinfo=START_TS.tzinfo),
+            end=datetime(2025, 12, 6, 18, 0, tzinfo=START_TS.tzinfo),
             region="west",
             component="app",
             description="Deployment-induced latency bump in west",
@@ -306,4 +334,7 @@ __all__ = [
     "build_incident",
     "default_confounders",
     "IMPACTED_TRANSACTION_TYPES",
+    "REGIONS",
+    "TXN_FACT_HEADERS",
+    "txn_fact_row",
 ]

@@ -11,22 +11,20 @@ SERVICE_METRIC_HEADERS = [
     "timestamp",
     "region",
     "transaction_type",
-    "req_count",
-    "p50_latency_ms",
+    "request_rate",
+    "error_rate",
     "p95_latency_ms",
-    "timeout_rate",
-    "retry_rate",
-    "queue_depth",
+    "p99_latency_ms",
+    "saturation",
 ]
 
 
 @dataclass
 class MetricBucket:
     latencies: List[float]
-    retries: int
-    timeouts: int
     requests: int
-    queue_depth: float
+    errors: int
+    retries: int
 
 
 class ServiceMetricAggregator:
@@ -35,18 +33,17 @@ class ServiceMetricAggregator:
 
     def add_fact(self, fact: TransactionFact) -> None:
         ts = fact.start_ts.replace(second=0, microsecond=0)
-        key = (isoformat(ts), fact.region, fact.transaction_type)
+        key = (isoformat(ts, ms=False), fact.region, fact.transaction_type)
         bucket = self.buckets.get(key)
         if not bucket:
-            bucket = MetricBucket([], 0, 0, 0, 0.0)
+            bucket = MetricBucket([], 0, 0, 0)
             self.buckets[key] = bucket
         bucket.latencies.append(fact.end_to_end_latency_ms)
         bucket.requests += 1
-        bucket.queue_depth += max(0, fact.retry_count - 1)
         if fact.retry_count > 0:
             bucket.retries += 1
         if fact.final_status == "timeout":
-            bucket.timeouts += 1
+            bucket.errors += 1
 
     def percentile(self, values: List[float], perc: float) -> float:
         if not values:
@@ -60,22 +57,21 @@ class ServiceMetricAggregator:
         rows = 0
         for (ts, region, txn_type), bucket in self.buckets.items():
             req = max(1, bucket.requests)
-            p50 = self.percentile(bucket.latencies, 0.5)
             p95 = self.percentile(bucket.latencies, 0.95)
-            timeout_rate = bucket.timeouts / req
+            p99 = self.percentile(bucket.latencies, 0.99)
+            error_rate = bucket.errors / req
             retry_rate = bucket.retries / req
-            queue = bucket.queue_depth / req
+            saturation = min(1.0, 0.15 + 0.7 * retry_rate + 1.0 * error_rate + 0.25 * min(1.0, p95 / 2500.0))
             writer.write_row(
                 [
                     ts,
                     region,
                     txn_type,
-                    bucket.requests,
-                    round(p50, 2),
+                    round(bucket.requests / 60.0, 4),
+                    round(error_rate, 4),
                     round(p95, 2),
-                    round(timeout_rate, 4),
-                    round(retry_rate, 4),
-                    round(queue, 2),
+                    round(p99, 2),
+                    round(saturation, 4),
                 ]
             )
             rows += 1

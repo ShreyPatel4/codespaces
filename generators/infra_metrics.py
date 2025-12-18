@@ -11,6 +11,7 @@ from utils import (
     END_TS,
 )
 from .txn_facts import TransactionFact
+from .txn_facts import REGIONS
 
 INFRA_HEADERS = [
     "timestamp",
@@ -28,7 +29,7 @@ HOSTS_PER_REGION = 12
 
 def generate_hosts() -> Dict[str, List[str]]:
     hosts = {}
-    for region in ["central", "east", "west"]:
+    for region in REGIONS:
         hosts[region] = [f"fibersqs-{region}-infra{idx:02d}" for idx in range(1, HOSTS_PER_REGION + 1)]
     return hosts
 
@@ -40,7 +41,7 @@ def write_infra_metrics(
     confounder_windows,
 ) -> Tuple[int, Dict[str, Dict[str, float]]]:
     rows = 0
-    cpu_debug: Dict[str, Dict[str, float]] = {"central": {"max": 0.0}, "west": {"max": 0.0}}
+    cpu_debug: Dict[str, Dict[str, float]] = {region: {"max": 0.0} for region in hosts}
     for ts in daterange_5m(START_TS, END_TS):
         for region, region_hosts in hosts.items():
             for host in region_hosts:

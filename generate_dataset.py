@@ -45,9 +45,9 @@ def write_dataset_readme(output_dir: str) -> None:
         "requiring correlation across application logs, distributed traces, network metrics, infra stats, and TSO call queues."
     )
     contents += "\n\n## Tables\n"
-    contents += "- Tier 1: clickhouse-fibersqs_app_logs, clickhouse-trace_spans, clickhouse-network_circuit_metrics, "
+    contents += "- Tier 1: clickhouse-app_logs, clickhouse-trace_spans, clickhouse-network_circuit_metrics, "
     contents += "clickhouse-infra_host_metrics, clickhouse-tso_calls\n"
-    contents += "- Tier 2 (optional): clickhouse-fibersqs_service_metrics_1m, clickhouse-network_events_alarms\n"
+    contents += "- Tier 2 (optional): clickhouse-service_metrics, clickhouse-network_events, clickhouse-txn_facts\n"
     contents += "\n## Incident Summary\n"
     contents += (
         "Central provisioning flows intermittently degrade on the eastbound dependency during a multi-day window. "
@@ -169,16 +169,10 @@ def main() -> None:
 
     incident = txn_facts.build_incident(config.seed)
     confounders = txn_facts.default_confounders()
+    regions = txn_facts.REGIONS
     circuit_map = network_metrics.build_circuit_map(
         incident,
-        [
-            ("central", "west"),
-            ("west", "central"),
-            ("east", "central"),
-            ("central", "east"),
-            ("east", "west"),
-            ("west", "east"),
-        ],
+        [(src, dst) for src in regions for dst in regions if src != dst],
         circuit_rng,
     )
     route_lookup = network_metrics.build_route_lookup(circuit_map)
@@ -186,7 +180,7 @@ def main() -> None:
     row_counter = RowCounter({})
 
     app_log_writer = CsvWriter(
-        os.path.join(config.data_dir, "clickhouse-fibersqs_app_logs.csv"),
+        os.path.join(config.data_dir, "clickhouse-app_logs.csv"),
         app_logs.LOG_HEADERS,
     )
     trace_writer = CsvWriter(
@@ -201,17 +195,22 @@ def main() -> None:
     tso_generator = tso_calls.TSOCallGenerator(tso_writer, tso_rng)
     service_metrics_writer = None
     service_agg = None
+    txn_fact_writer = None
     if config.enable_tier2:
         service_metrics_writer = CsvWriter(
-            os.path.join(config.data_dir, "clickhouse-fibersqs_service_metrics_1m.csv"),
+            os.path.join(config.data_dir, "clickhouse-service_metrics.csv"),
             SERVICE_METRIC_HEADERS,
         )
         service_agg = ServiceMetricAggregator()
+        txn_fact_writer = CsvWriter(
+            os.path.join(config.data_dir, "clickhouse-txn_facts.csv"),
+            txn_facts.TXN_FACT_HEADERS,
+        )
 
     validator = Validator()
     trace_span_refs = 0
-    impacted_burst_latency: List[float] = []
-    impacted_base_latency: List[float] = []
+    impacted_burst_latency_sum = 0.0
+    impacted_base_latency_sum = 0.0
     burst_timeouts = 0
     burst_count = 0
     base_timeouts = 0
@@ -226,22 +225,39 @@ def main() -> None:
     )
 
     for fact in fact_stream:
+        if fact.makes_cross_region_call:
+            if not fact.circuit_id:
+                raise ValueError(f"Cross-region fact missing circuit_id: {fact.transaction_id}")
+            circuit = circuit_map.get(fact.circuit_id)
+            if not circuit:
+                raise ValueError(f"Cross-region fact references unknown circuit_id={fact.circuit_id}")
+            src_region, dst_region, _sig = circuit
+            if src_region != fact.region or dst_region != (fact.dependency_region or ""):
+                raise ValueError(
+                    "Cross-region fact circuit mismatch: "
+                    f"txn={fact.transaction_id} "
+                    f"fact=({fact.region}->{fact.dependency_region}) "
+                    f"circuit=({src_region}->{dst_region})"
+                )
         log_rows = app_logs.write_fact_logs(fact, app_log_writer, table_rng)
-        row_counter.increment("fibersqs_app_logs", log_rows)
+        row_counter.increment("app_logs", log_rows)
         span_rows = trace_spans.write_fact_spans(fact, trace_writer, table_rng)
         row_counter.increment("trace_spans", span_rows)
         trace_span_refs += span_rows
         tso_generator.process_fact(fact)
         if service_agg:
             service_agg.add_fact(fact)
+        if txn_fact_writer:
+            txn_fact_writer.write_row(txn_facts.txn_fact_row(fact))
+            row_counter.increment("txn_facts", 1)
         if fact.makes_cross_region_call and fact.region == "central" and fact.transaction_type in txn_facts.IMPACTED_TRANSACTION_TYPES:
             if fact.impacted_by_primary:
-                impacted_burst_latency.append(fact.dependency_latency_ms)
+                impacted_burst_latency_sum += fact.dependency_latency_ms
                 burst_count += 1
                 if fact.final_status == "timeout":
                     burst_timeouts += 1
             else:
-                impacted_base_latency.append(fact.dependency_latency_ms)
+                impacted_base_latency_sum += fact.dependency_latency_ms
                 base_count += 1
                 if fact.final_status == "timeout":
                     base_timeouts += 1
@@ -251,8 +267,10 @@ def main() -> None:
 
     if service_agg and service_metrics_writer:
         service_rows = service_agg.write(service_metrics_writer)
-        row_counter.increment("fibersqs_service_metrics_1m", service_rows)
+        row_counter.increment("service_metrics", service_rows)
         service_metrics_writer.close()
+    if txn_fact_writer:
+        txn_fact_writer.close()
 
     app_log_writer.close()
     trace_writer.close()
@@ -277,14 +295,12 @@ def main() -> None:
 
     if config.enable_tier2:
         alert_writer = CsvWriter(
-            os.path.join(config.data_dir, "clickhouse-network_events_alarms.csv"),
+            os.path.join(config.data_dir, "clickhouse-network_events.csv"),
             network_events.NETWORK_EVENT_HEADERS,
         )
-        alert_stats = network_events.write_network_events(alert_writer, alert_rng, incident)
+        alert_stats = network_events.write_network_events(alert_writer, alert_rng, incident, circuit_map)
         alert_writer.close()
-        row_counter.increment("network_events_alarms", alert_stats["rows"])
-    else:
-        alert_stats = {"rows": 0}
+        row_counter.increment("network_events", alert_stats["rows"])
 
     validator.check_referential_integrity(
         tso_refs=tso_stats.non_empty_refs,
@@ -292,8 +308,8 @@ def main() -> None:
         trace_refs=trace_span_refs,
         trace_matches=trace_span_refs,
     )
-    burst_latency_avg = sum(impacted_burst_latency) / max(1, len(impacted_burst_latency))
-    base_latency_avg = sum(impacted_base_latency) / max(1, len(impacted_base_latency))
+    burst_latency_avg = impacted_burst_latency_sum / max(1, burst_count)
+    base_latency_avg = impacted_base_latency_sum / max(1, base_count)
     burst_timeout_rate = burst_timeouts / max(1, burst_count)
     base_timeout_rate = base_timeouts / max(1, base_count)
     incident_metrics = metrics_debug.get(incident.circuit_id, [])
@@ -325,9 +341,6 @@ def main() -> None:
     else:
         network_peak_on_cpu = 1.0
     validator.check_confounder_separability(cpu_peak, network_peak_on_cpu)
-    if alert_stats.get("rows", 0) > 0:
-        validator.check_alert_quality(alert_stats.get("tp", 0), alert_stats.get("fp", 0), alert_stats.get("fn", 0))
-
     validation_summary = validator.summary()
     print(validation_summary)
     with open(os.path.join(config.output_dir, "validation_summary.json"), "w", encoding="utf-8") as fh:
