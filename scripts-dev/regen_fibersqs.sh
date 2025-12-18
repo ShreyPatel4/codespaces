@@ -12,6 +12,17 @@ CLICKHOUSE_URL=${CLICKHOUSE_URL:-http://localhost:8123}
 CLICKHOUSE_USER=${CLICKHOUSE_USER:-default}
 CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-default}
 
+RAW_CLICKHOUSE_BASE="${CLICKHOUSE_URL%%\?*}"
+RAW_CLICKHOUSE_BASE="${RAW_CLICKHOUSE_BASE%/}"
+CLICKHOUSE_BASE="${RAW_CLICKHOUSE_BASE%/}"
+
+export CLICKHOUSE_URL="$CLICKHOUSE_BASE"
+
+if [[ -z "$CLICKHOUSE_BASE" ]]; then
+  echo "[regen_fibersqs] Invalid CLICKHOUSE_URL: ${CLICKHOUSE_URL}" >&2
+  exit 1
+fi
+
 REGIONS=("east" "west" "central" "north" "south")
 
 log() {
@@ -70,19 +81,86 @@ if [[ -z "$OUTPUT_DIR" || "$OUTPUT_DIR" == "/" ]]; then
   exit 1
 fi
 
+log "Checking ClickHouse availability at ${CLICKHOUSE_BASE}/"
+ping_body="$(clickhouse_get "/ping")"
+if [[ "${ping_body//$'\n'/}" != "Ok." ]]; then
+  echo "[regen_fibersqs] ClickHouse ping failed or unexpected response: ${ping_body}" >&2
+  exit 1
+fi
+
 # ClickHouse query helpers (HTTP POST only; fail fast on 4xx/5xx)
+clickhouse_post() {
+  local sql="$1"
+  local path="${2:-/}"
+  local tmp
+  tmp="$(mktemp)"
+  local status
+  local curl_exit=0
+  status=$(curl -sS -u "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" \
+    --data-binary "$sql" \
+    -o "$tmp" \
+    -w '%{http_code}' \
+    "${CLICKHOUSE_BASE}${path}") || curl_exit=$?
+  if [[ $curl_exit -ne 0 ]]; then
+    echo "[regen_fibersqs] curl failed (exit=${curl_exit}) for ${CLICKHOUSE_BASE}${path}" >&2
+    if [[ -s "$tmp" ]]; then
+      echo "[regen_fibersqs] Response body:" >&2
+      cat "$tmp" >&2
+    fi
+    rm -f "$tmp"
+    exit 1
+  fi
+  if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+    echo "[regen_fibersqs] ClickHouse request failed (status=${status}) for ${CLICKHOUSE_BASE}${path}" >&2
+    if [[ -s "$tmp" ]]; then
+      cat "$tmp" >&2
+    fi
+    rm -f "$tmp"
+    exit 1
+  fi
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
+clickhouse_get() {
+  local path="$1"
+  local tmp
+  tmp="$(mktemp)"
+  local status
+  local curl_exit=0
+  status=$(curl -sS -X GET -u "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" \
+    -o "$tmp" \
+    -w '%{http_code}' \
+    "${CLICKHOUSE_BASE}${path}") || curl_exit=$?
+  if [[ $curl_exit -ne 0 ]]; then
+    echo "[regen_fibersqs] curl failed (exit=${curl_exit}) for ${CLICKHOUSE_BASE}${path}" >&2
+    if [[ -s "$tmp" ]]; then
+      echo "[regen_fibersqs] Response body:" >&2
+      cat "$tmp" >&2
+    fi
+    rm -f "$tmp"
+    exit 1
+  fi
+  if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+    echo "[regen_fibersqs] ClickHouse GET failed (status=${status}) for ${CLICKHOUSE_BASE}${path}" >&2
+    if [[ -s "$tmp" ]]; then
+      cat "$tmp" >&2
+    fi
+    rm -f "$tmp"
+    exit 1
+  fi
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
 run_sql() {
   local sql="$1"
-  curl -sS -f -u "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" \
-    --data-binary "$sql" \
-    "$CLICKHOUSE_URL/" >/dev/null
+  clickhouse_post "$sql" "/" >/dev/null
 }
 
 run_sql_raw() {
   local sql="$1"
-  curl -sS -f -u "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" \
-    --data-binary "$sql" \
-    "$CLICKHOUSE_URL/"
+  clickhouse_post "$sql" "/"
 }
 
 run_sql_json() {
@@ -136,23 +214,24 @@ for view in fibersqs_app_logs trace_spans network_circuit_metrics infra_host_met
   run_sql "DROP VIEW IF EXISTS ${COMPAT_DB}.${view}"
 done
 
-# Drop ES-style views (region + daily shards).
+# Drop ES-style views (region + daily shards) from older runs.
 for region in "${REGIONS[@]}"; do
   run_sql "$(printf 'DROP VIEW IF EXISTS fibersqs_prod.`fibersqs-prod-%s-app-logs`' "$region")"
+  run_sql "$(printf 'DROP VIEW IF EXISTS fibersqs_prod.fibersqs_prod_%s_app_logs' "$region")"
 done
-daily_views="$(run_sql_raw "SELECT name FROM system.tables WHERE database='fibersqs_prod' AND engine='View' AND name LIKE 'fibersqs-prod-%-app-logs-%' FORMAT TSVRaw")"
+index_views_to_drop="$(run_sql_raw "SELECT name FROM system.tables WHERE database='fibersqs_prod' AND engine='View' AND (name LIKE 'fibersqs-prod-%-app-logs-%' OR name LIKE 'fibersqs_prod_%_app_logs_%') FORMAT TSVRaw")"
 while IFS= read -r view_name; do
   [[ -z "$view_name" ]] && continue
   run_sql "$(printf 'DROP VIEW IF EXISTS fibersqs_prod.`%s`' "$view_name")"
-done <<< "$daily_views"
+done <<< "$index_views_to_drop"
 
 # Drop canonical tables.
 for table in app_logs trace_spans network_circuit_metrics infra_host_metrics tso_calls service_metrics network_events txn_facts; do
   run_sql "DROP TABLE IF EXISTS fibersqs_prod.${table}"
 done
 
-# Drop legacy tables in the working db (from older runs).
-for table in fibersqs_app_logs trace_spans network_circuit_metrics infra_host_metrics tso_calls fibersqs_service_metrics_1m network_events_alarms service_metrics network_events txn_facts app_logs; do
+# Drop legacy dataset-specific tables in the working db (from older runs).
+for table in fibersqs_service_metrics_1m network_events_alarms service_metrics network_events txn_facts app_logs; do
   run_sql "DROP TABLE IF EXISTS ${COMPAT_DB}.${table}"
 done
 
@@ -329,30 +408,44 @@ log "Loading CSVs into ClickHouse (fibersqs_prod.*)"
 "$LOADER_SCRIPT" -s "$OUTPUT_DIR/data" --database fibersqs_prod --insert-only
 
 log "Creating compatibility views in ${COMPAT_DB} (backward compatible names)"
-run_sql "CREATE VIEW ${COMPAT_DB}.fibersqs_app_logs AS SELECT * FROM fibersqs_prod.app_logs"
-run_sql "CREATE VIEW ${COMPAT_DB}.trace_spans AS SELECT * FROM fibersqs_prod.trace_spans"
-run_sql "CREATE VIEW ${COMPAT_DB}.network_circuit_metrics AS SELECT * FROM fibersqs_prod.network_circuit_metrics"
-run_sql "CREATE VIEW ${COMPAT_DB}.infra_host_metrics AS SELECT * FROM fibersqs_prod.infra_host_metrics"
-run_sql "CREATE VIEW ${COMPAT_DB}.tso_calls AS SELECT * FROM fibersqs_prod.tso_calls"
+run_sql "CREATE OR REPLACE VIEW ${COMPAT_DB}.fibersqs_app_logs AS SELECT * FROM fibersqs_prod.app_logs"
+run_sql "CREATE OR REPLACE VIEW ${COMPAT_DB}.trace_spans AS SELECT * FROM fibersqs_prod.trace_spans"
+run_sql "CREATE OR REPLACE VIEW ${COMPAT_DB}.network_circuit_metrics AS SELECT * FROM fibersqs_prod.network_circuit_metrics"
+run_sql "CREATE OR REPLACE VIEW ${COMPAT_DB}.infra_host_metrics AS SELECT * FROM fibersqs_prod.infra_host_metrics"
+run_sql "CREATE OR REPLACE VIEW ${COMPAT_DB}.tso_calls AS SELECT * FROM fibersqs_prod.tso_calls"
+
+APP_LOG_SOURCE="${COMPAT_DB}.fibersqs_app_logs"
+TRACE_SOURCE="${COMPAT_DB}.trace_spans"
+NETWORK_SOURCE="${COMPAT_DB}.network_circuit_metrics"
+INFRA_SOURCE="${COMPAT_DB}.infra_host_metrics"
+TSO_SOURCE="${COMPAT_DB}.tso_calls"
 
 log "Creating ES-style app log views (region + daily shards)"
-for region in "${REGIONS[@]}"; do
-  run_sql "$(printf 'CREATE VIEW fibersqs_prod.`fibersqs-prod-%s-app-logs` AS SELECT * FROM fibersqs_prod.app_logs WHERE region='\''%s'\''' "$region" "$region")"
-done
+day_span_json="$(run_sql_json "SELECT toString(min(toDate(parseDateTimeBestEffort(timestamp)))) AS min_day, toString(max(toDate(parseDateTimeBestEffort(timestamp)))) AS max_day FROM ${APP_LOG_SOURCE}")"
+export DAY_SPAN_JSON="$day_span_json"
+read -r MIN_DAY MAX_DAY <<< "$(python - <<'PY'
+import json, os
+payload = os.environ.get("DAY_SPAN_JSON", "{}")
+data = json.loads(payload).get("data", [{}])[0]
+min_day = (data.get("min_day") or "").strip()
+max_day = (data.get("max_day") or "").strip()
+print(min_day, max_day)
+PY
+)"
 
-max_day="$(run_sql_raw "SELECT toString(max(toDate(ts))) FROM fibersqs_prod.app_logs")"
-max_day="${max_day//$'\n'/}"
-if [[ -z "$max_day" || "$max_day" == "\\N" ]]; then
-  echo "[regen_fibersqs] Unable to determine max_day from fibersqs_prod.app_logs" >&2
+if [[ -z "$MIN_DAY" || -z "$MAX_DAY" || "$MIN_DAY" == "\\N" || "$MAX_DAY" == "\\N" ]]; then
+  echo "[regen_fibersqs] Unable to determine day span from ${APP_LOG_SOURCE}" >&2
   exit 1
 fi
-export MAX_DAY="$max_day"
 
-daily_views="$(run_sql_raw "SELECT name FROM system.tables WHERE database='fibersqs_prod' AND engine='View' AND name LIKE 'fibersqs-prod-%-app-logs-%' FORMAT TSVRaw")"
-while IFS= read -r view_name; do
-  [[ -z "$view_name" ]] && continue
-  run_sql "$(printf 'DROP VIEW IF EXISTS fibersqs_prod.`%s`' "$view_name")"
-done <<< "$daily_views"
+export MIN_DAY
+export MAX_DAY
+
+region_view_count=0
+for region in "${REGIONS[@]}"; do
+  run_sql "$(printf 'CREATE VIEW IF NOT EXISTS fibersqs_prod.fibersqs_prod_%s_app_logs AS SELECT * FROM %s WHERE region='\''%s'\''' "$region" "$APP_LOG_SOURCE" "$region")"
+  ((region_view_count++))
+done
 
 day_pairs="$(python - <<'PY'
 from __future__ import annotations
@@ -360,22 +453,40 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import os
 
-max_day = os.environ["MAX_DAY"].strip()
-max_date = datetime.strptime(max_day, "%Y-%m-%d").date()
-start_date = max_date - timedelta(days=6)
-for offset in range(7):
-    d = start_date + timedelta(days=offset)
-    print(d.strftime("%Y-%m-%d"), d.strftime("%Y%m%d"))
+start = datetime.strptime(os.environ["MIN_DAY"], "%Y-%m-%d").date()
+end = datetime.strptime(os.environ["MAX_DAY"], "%Y-%m-%d").date()
+current = start
+while current <= end:
+    print(current.strftime("%Y-%m-%d"), current.strftime("%Y%m%d"))
+    current += timedelta(days=1)
 PY
 )"
 
+daily_view_count=0
 while read -r day_iso day_suffix; do
   [[ -z "$day_iso" ]] && continue
   for region in "${REGIONS[@]}"; do
-    view_name="fibersqs-prod-${region}-app-logs-${day_suffix}"
-    run_sql "$(printf 'CREATE VIEW fibersqs_prod.`%s` AS SELECT * FROM fibersqs_prod.app_logs WHERE region='\''%s'\'' AND toDate(ts)=toDate('\''%s'\'')' "$view_name" "$region" "$day_iso")"
+    view_name="fibersqs_prod_${region}_app_logs_${day_suffix}"
+    run_sql "$(printf 'CREATE VIEW IF NOT EXISTS fibersqs_prod.%s AS SELECT * FROM %s WHERE region='\''%s'\'' AND toDate(parseDateTimeBestEffort(timestamp))=toDate('\''%s'\'')' "$view_name" "$APP_LOG_SOURCE" "$region" "$day_iso")"
+    ((daily_view_count++))
   done
 done <<< "$day_pairs"
+
+VIEW_TABLE_LISTING="$(run_sql_raw "SHOW TABLES FROM fibersqs_prod LIKE 'fibersqs_prod_%_app_logs%'")"
+VIEW_COUNT_JSON="$(run_sql_json "SELECT
+  countIf(match(name, '^fibersqs_prod_[a-z]+_app_logs$')) AS region_views,
+  countIf(match(name, '^fibersqs_prod_[a-z]+_app_logs_[0-9]{8}$')) AS daily_views
+FROM system.tables
+WHERE database='fibersqs_prod' AND engine='View' AND name LIKE 'fibersqs_prod_%_app_logs%'")"
+
+REGION_DISTRIBUTION_JSON="$(run_sql_json "SELECT region, count() AS rows FROM ${APP_LOG_SOURCE} GROUP BY region ORDER BY region")"
+
+export DAY_SPAN_JSON="$day_span_json"
+export VIEW_COUNT_JSON
+export VIEW_TABLE_LISTING
+export REGION_DISTRIBUTION_JSON
+export REGION_VIEW_COUNT="$region_view_count"
+export DAILY_VIEW_COUNT="$daily_view_count"
 
 log "Collecting post-load validation metrics"
 
@@ -384,9 +495,9 @@ export OUTPUT_DIR
 export IMPACTED_VOLUME_JSON="$(
   run_sql_json "WITH per_minute AS (
     SELECT
-      toStartOfMinute(ts) AS minute,
+      toStartOfMinute(parseDateTimeBestEffort(timestamp)) AS minute,
       count() AS reqs
-    FROM fibersqs_prod.app_logs
+    FROM ${APP_LOG_SOURCE}
     WHERE event='received'
       AND region='central'
       AND transaction_type IN ('provision_fiber_sqs','modify_service_profile')
@@ -413,17 +524,17 @@ FIX_TIME="${FIX_TIME//$'\n'/}"
 export FIX_VERIFICATION_JSON="$(
   run_sql_json "WITH toDateTime64('$FIX_TIME', 3) AS fix
   SELECT
-    if(ts < fix, 'pre_fix', 'post_fix') AS window,
+    if(log_ts < fix, 'pre_fix', 'post_fix') AS window,
     quantileTDigest(0.95)(lat) AS p95_latency_ms,
     quantileTDigest(0.99)(lat) AS p99_latency_ms,
     round(countIf(event='timeout')/count(), 4) AS timeout_rate,
     count() AS n
   FROM (
     SELECT
-      ts,
-      end_to_end_latency_ms_f64 AS lat,
+      parseDateTimeBestEffort(timestamp) AS log_ts,
+      toFloat64OrZero(end_to_end_latency_ms) AS lat,
       event
-    FROM fibersqs_prod.app_logs
+    FROM ${APP_LOG_SOURCE}
     WHERE event IN ('completed','timeout')
       AND region='central'
       AND transaction_type IN ('provision_fiber_sqs','modify_service_profile')
@@ -436,16 +547,16 @@ export TSO_MISSING_JSON="$(
   run_sql_json "SELECT
     round(countIf(transaction_id='')/count(),4) AS missing_rate,
     count() AS total
-  FROM fibersqs_prod.tso_calls"
+  FROM ${TSO_SOURCE}"
 )"
 
 export TSO_NONEXISTENT_JSON="$(
   run_sql_json "WITH logs AS (
     SELECT DISTINCT transaction_id
-    FROM fibersqs_prod.app_logs
+    FROM ${APP_LOG_SOURCE}
     WHERE event='received'
   ),
-  denom AS (SELECT countIf(transaction_id!='') AS calls_with_txn FROM fibersqs_prod.tso_calls)
+  denom AS (SELECT countIf(transaction_id!='') AS calls_with_txn FROM ${TSO_SOURCE})
   SELECT
     round(
       if((SELECT calls_with_txn FROM denom)=0, 0,
@@ -458,13 +569,13 @@ export TSO_NONEXISTENT_JSON="$(
 export TSO_MISMATCH_JSON="$(
   run_sql_json "WITH log_txn AS (
     SELECT transaction_id, any(customer_id) AS log_customer_id
-    FROM fibersqs_prod.app_logs
+    FROM ${APP_LOG_SOURCE}
     WHERE event='received'
     GROUP BY transaction_id
   )
   SELECT
     round(countIf(t.customer_id != l.log_customer_id)/count(), 4) AS mismatch_rate
-  FROM fibersqs_prod.tso_calls t
+  FROM ${TSO_SOURCE} t
   INNER JOIN log_txn l USING (transaction_id)
   WHERE t.transaction_id!=''"
 )"
@@ -472,7 +583,7 @@ export TSO_MISMATCH_JSON="$(
 export TSO_CONFUSION_JSON="$(
   run_sql_json "WITH log_txn AS (
     SELECT transaction_id, any(customer_id) AS log_customer_id
-    FROM fibersqs_prod.app_logs
+    FROM ${APP_LOG_SOURCE}
     WHERE event='received'
     GROUP BY transaction_id
   ),
@@ -486,7 +597,7 @@ export TSO_CONFUSION_JSON="$(
       countIf(transaction_id!='') AS non_empty_calls
     FROM (
       SELECT t.transaction_id, t.customer_id, l.log_customer_id
-      FROM fibersqs_prod.tso_calls t
+      FROM ${TSO_SOURCE} t
       LEFT JOIN log_txn l USING (transaction_id)
     )
   )
@@ -531,9 +642,17 @@ export INCIDENT_MULTIPLIER_JSON="$(
     base AS (
       SELECT
         region,
-        quantileTDigestIf(0.95)(end_to_end_latency_ms_f64, ts < incident_start) AS p95_baseline,
-        quantileTDigestIf(0.95)(end_to_end_latency_ms_f64, ts >= incident_start AND ts < incident_end) AS p95_incident
-      FROM fibersqs_prod.app_logs
+        quantileTDigestIf(0.95)(lat, log_ts < incident_start) AS p95_baseline,
+        quantileTDigestIf(0.95)(lat, log_ts >= incident_start AND log_ts < incident_end) AS p95_incident
+      FROM (
+        SELECT
+          region,
+          parseDateTimeBestEffort(timestamp) AS log_ts,
+          toFloat64OrZero(end_to_end_latency_ms) AS lat,
+          event,
+          transaction_type
+        FROM ${APP_LOG_SOURCE}
+      )
       WHERE event IN ('completed','timeout')
         AND transaction_type IN ('provision_fiber_sqs','modify_service_profile')
       GROUP BY region
@@ -556,9 +675,9 @@ export TOP_CIRCUIT_UPLIFT_JSON="$(
         circuit_id,
         any(src_region) AS src_region,
         any(dst_region) AS dst_region,
-        quantileTDigestIf(0.95)(rtt_ms, ts < incident_start) AS p95_baseline,
-        quantileTDigestIf(0.95)(rtt_ms, ts >= incident_start AND ts < incident_end) AS p95_incident
-      FROM fibersqs_prod.network_circuit_metrics
+        quantileTDigestIf(0.95)(rtt_ms, parseDateTimeBestEffort(timestamp) < incident_start) AS p95_baseline,
+        quantileTDigestIf(0.95)(rtt_ms, parseDateTimeBestEffort(timestamp) >= incident_start AND parseDateTimeBestEffort(timestamp) < incident_end) AS p95_incident
+      FROM ${NETWORK_SOURCE}
       WHERE src_region='central' AND dst_region='east'
       GROUP BY circuit_id
     )
@@ -574,6 +693,25 @@ export TOP_CIRCUIT_UPLIFT_JSON="$(
   LIMIT 5"
 )"
 
+export TIER2_COUNTS_JSON="$(
+  run_sql_json "SELECT table, present, rows FROM (
+    SELECT
+      'service_metrics' AS table,
+      (SELECT count() FROM system.tables WHERE database='fibersqs_prod' AND name='service_metrics') AS present,
+      (SELECT sum(rows) FROM system.parts WHERE database='fibersqs_prod' AND table='service_metrics') AS rows
+    UNION ALL
+    SELECT
+      'network_events' AS table,
+      (SELECT count() FROM system.tables WHERE database='fibersqs_prod' AND name='network_events') AS present,
+      (SELECT sum(rows) FROM system.parts WHERE database='fibersqs_prod' AND table='network_events') AS rows
+    UNION ALL
+    SELECT
+      'txn_facts' AS table,
+      (SELECT count() FROM system.tables WHERE database='fibersqs_prod' AND name='txn_facts') AS present,
+      (SELECT sum(rows) FROM system.parts WHERE database='fibersqs_prod' AND table='txn_facts') AS rows
+  )"
+)"
+
 python - <<'PY'
 import json, os
 from pathlib import Path
@@ -586,12 +724,26 @@ output_dir = Path(os.environ["OUTPUT_DIR"])
 report_path = output_dir / "postload_validation.json"
 
 confusion = first_row(os.environ["TSO_CONFUSION_JSON"])
+region_distribution = json.loads(os.environ["REGION_DISTRIBUTION_JSON"]).get("data", [])
+day_span = first_row(os.environ["DAY_SPAN_JSON"])
+view_counts = first_row(os.environ["VIEW_COUNT_JSON"])
+view_tables = [line for line in os.environ.get("VIEW_TABLE_LISTING", "").splitlines() if line.strip()]
+tier2_counts = json.loads(os.environ["TIER2_COUNTS_JSON"]).get("data", [])
 
 report = {
   "impacted_slice_volume": first_row(os.environ["IMPACTED_VOLUME_JSON"]),
+  "dataset_bounds": day_span,
   "fix_verification": json.loads(os.environ["FIX_VERIFICATION_JSON"]).get("data", []),
   "incident_p95_multiplier": json.loads(os.environ["INCIDENT_MULTIPLIER_JSON"]).get("data", []),
   "top_central_to_east_circuit_uplift": json.loads(os.environ["TOP_CIRCUIT_UPLIFT_JSON"]).get("data", []),
+  "app_log_region_distribution": region_distribution,
+  "view_creation": {
+    "expected_region_views": int(os.environ.get("REGION_VIEW_COUNT", "0")),
+    "expected_daily_views": int(os.environ.get("DAILY_VIEW_COUNT", "0")),
+    "actual_counts": view_counts,
+    "tables_like": view_tables,
+  },
+  "tier2": {"tables": tier2_counts},
   "tso_postload": {
     "missing": first_row(os.environ["TSO_MISSING_JSON"]),
     "nonexistent": first_row(os.environ["TSO_NONEXISTENT_JSON"]),
