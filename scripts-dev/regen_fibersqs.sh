@@ -38,33 +38,19 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output_dir)
-      OUTPUT_DIR="$2"
-      shift 2
-      ;;
+      OUTPUT_DIR="$2"; shift 2 ;;
     --seed)
-      SEED="$2"
-      shift 2
-      ;;
+      SEED="$2"; shift 2 ;;
     --app_log_rows)
-      APP_LOG_ROWS="$2"
-      shift 2
-      ;;
+      APP_LOG_ROWS="$2"; shift 2 ;;
     --scale_logs)
-      SCALE_LOGS="$2"
-      shift 2
-      ;;
+      SCALE_LOGS="$2"; shift 2 ;;
     --zip)
-      ZIP_FLAG="--zip"
-      shift 1
-      ;;
+      ZIP_FLAG="--zip"; shift 1 ;;
     --no-zip)
-      ZIP_FLAG="--no-zip"
-      shift 1
-      ;;
+      ZIP_FLAG="--no-zip"; shift 1 ;;
     -h|--help)
-      usage
-      exit 0
-      ;;
+      usage; exit 0 ;;
     *)
       echo "[regen_fibersqs] Unknown argument: $1" >&2
       usage
@@ -78,14 +64,21 @@ if [[ -z "$OUTPUT_DIR" || "$OUTPUT_DIR" == "/" ]]; then
   exit 1
 fi
 
+# Robust ClickHouse query helpers (URL-encode queries; fail fast on 4xx/5xx)
 run_sql() {
   local sql="$1"
-  curl -sS -f -u "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" --data-binary "$sql" "$CLICKHOUSE_URL/" >/dev/null
+  curl -sS -fG "$CLICKHOUSE_URL/" \
+    --data-urlencode "user=$CLICKHOUSE_USER" \
+    --data-urlencode "password=$CLICKHOUSE_PASSWORD" \
+    --data-urlencode "query=$sql" >/dev/null
 }
 
 run_sql_json() {
   local sql="$1"
-  curl -sS -f -u "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" --data-binary "$sql FORMAT JSON" "$CLICKHOUSE_URL/"
+  curl -sS -fG "$CLICKHOUSE_URL/" \
+    --data-urlencode "user=$CLICKHOUSE_USER" \
+    --data-urlencode "password=$CLICKHOUSE_PASSWORD" \
+    --data-urlencode "query=$sql FORMAT JSON"
 }
 
 detect_generator() {
@@ -103,7 +96,7 @@ detect_generator() {
   exit 1
 }
 
-GENERATOR_SCRIPT=$(detect_generator)
+GENERATOR_SCRIPT="$(detect_generator)"
 LOADER_SCRIPT="./scripts/load_csv_into_clickhouse.sh"
 
 if [[ ! -x "$LOADER_SCRIPT" ]]; then
@@ -132,49 +125,114 @@ log "Loading CSVs into ClickHouse"
 "$LOADER_SCRIPT" -s "$OUTPUT_DIR/data"
 
 log "Collecting validation metrics"
+
 export OUTPUT_DIR
-export IMPACTED_VOLUME_JSON="$(run_sql_json "WITH per_minute AS (SELECT toStartOfMinute(parseDateTimeBestEffort(timestamp)) AS minute, count() AS reqs FROM fibersqs_app_logs WHERE event='received' AND region='central' AND transaction_type IN ('provision_fiber_sqs','modify_service_profile') GROUP BY minute) SELECT quantile(0.5)(reqs) AS median_rpm, quantile(0.95)(reqs) AS p95_rpm, max(reqs) AS max_rpm FROM per_minute")"
 
-FIX_TIME=$(python - <<'PY'
-import json
-import os
+# Impacted slice: request volume per minute (safe parsing)
+export IMPACTED_VOLUME_JSON="$(
+  run_sql_json "WITH per_minute AS (
+    SELECT
+      toStartOfMinute(parseDateTimeBestEffort(timestamp)) AS minute,
+      count() AS reqs
+    FROM fibersqs_app_logs
+    WHERE event='received'
+      AND region='central'
+      AND transaction_type IN ('provision_fiber_sqs','modify_service_profile')
+    GROUP BY minute
+  )
+  SELECT
+    quantileTDigest(0.50)(reqs) AS median_rpm,
+    quantileTDigest(0.95)(reqs) AS p95_rpm,
+    max(reqs) AS max_rpm
+  FROM per_minute"
+)"
+
+FIX_TIME="$(python - <<'PY'
+import json, os
 from pathlib import Path
-
-output_dir = os.environ.get("OUTPUT_DIR")
-ground_truth_path = Path(output_dir) / "ground_truth.json"
-with open(ground_truth_path, "r", encoding="utf-8") as fh:
-    data = json.load(fh)
+output_dir = os.environ["OUTPUT_DIR"]
+gt = Path(output_dir) / "ground_truth.json"
+data = json.loads(gt.read_text(encoding="utf-8"))
 print(data["primary_incident"]["fix_time"])
 PY
-)
+)"
 FIX_TIME="${FIX_TIME//$'\n'/}"
 
-export FIX_VERIFICATION_JSON="$(run_sql_json "WITH toDateTime64('$FIX_TIME', 3) AS fix SELECT if(timestamp < fix, 'pre_fix', 'post_fix') AS window, quantile(0.95)(end_to_end_latency_ms) AS p95_latency_ms, quantile(0.99)(end_to_end_latency_ms) AS p99_latency_ms, round(countIf(event='timeout')/count(),4) AS timeout_rate FROM fibersqs_app_logs WHERE event IN ('completed','timeout') AND region='central' AND transaction_type IN ('provision_fiber_sqs','modify_service_profile') GROUP BY window ORDER BY window")"
+# Fix verification: MUST parse timestamp string before comparing, and cast latency for quantiles
+export FIX_VERIFICATION_JSON="$(
+  run_sql_json "WITH toDateTime64('$FIX_TIME', 3) AS fix
+  SELECT
+    if(ts < fix, 'pre_fix', 'post_fix') AS window,
+    quantileTDigest(0.95)(lat) AS p95_latency_ms,
+    quantileTDigest(0.99)(lat) AS p99_latency_ms,
+    round(countIf(event='timeout')/count(), 4) AS timeout_rate,
+    count() AS n
+  FROM (
+    SELECT
+      parseDateTimeBestEffort(timestamp) AS ts,
+      toFloat64(end_to_end_latency_ms) AS lat,
+      event
+    FROM fibersqs_app_logs
+    WHERE event IN ('completed','timeout')
+      AND region='central'
+      AND transaction_type IN ('provision_fiber_sqs','modify_service_profile')
+  )
+  GROUP BY window
+  ORDER BY window"
+)"
 
-export TSO_MISSING_JSON="$(run_sql_json "SELECT round(countIf(transaction_id='')/count(),4) AS missing_rate, count() total FROM tso_calls")"
-export TSO_NONEXISTENT_JSON="$(run_sql_json "WITH logs AS (SELECT DISTINCT transaction_id FROM fibersqs_app_logs) SELECT round(countIf(transaction_id!='' AND transaction_id NOT IN (SELECT transaction_id FROM logs)) / countIf(transaction_id!=''),4) AS nonexistent_rate FROM tso_calls")"
-export TSO_MISMATCH_JSON="$(run_sql_json "WITH log_txn AS (SELECT transaction_id, any(customer_id) AS log_customer_id FROM fibersqs_app_logs WHERE transaction_id!='' GROUP BY transaction_id) SELECT round(countIf(t.customer_id != l.log_customer_id)/count(),4) AS mismatch_rate FROM tso_calls t INNER JOIN log_txn l USING(transaction_id) WHERE t.transaction_id!=''")"
+export TSO_MISSING_JSON="$(
+  run_sql_json "SELECT
+    round(countIf(transaction_id='')/count(),4) AS missing_rate,
+    count() AS total
+  FROM tso_calls"
+)"
+
+export TSO_NONEXISTENT_JSON="$(
+  run_sql_json "WITH logs AS (SELECT DISTINCT transaction_id FROM fibersqs_app_logs),
+  denom AS (SELECT countIf(transaction_id!='') AS calls_with_txn FROM tso_calls)
+  SELECT
+    round(
+      if((SELECT calls_with_txn FROM denom)=0, 0,
+        countIf(transaction_id!='' AND transaction_id NOT IN (SELECT transaction_id FROM logs)) /
+        (SELECT calls_with_txn FROM denom)
+      ), 4
+    ) AS nonexistent_rate"
+)"
+
+export TSO_MISMATCH_JSON="$(
+  run_sql_json "WITH log_txn AS (
+    SELECT transaction_id, any(customer_id) AS log_customer_id
+    FROM fibersqs_app_logs
+    WHERE transaction_id!=''
+    GROUP BY transaction_id
+  )
+  SELECT
+    round(countIf(t.customer_id != l.log_customer_id)/count(), 4) AS mismatch_rate
+  FROM tso_calls t
+  INNER JOIN log_txn l USING (transaction_id)
+  WHERE t.transaction_id!=''"
+)"
 
 python - <<'PY'
-import json
-import os
+import json, os
 from pathlib import Path
 
 def first_row(payload: str):
-    data = json.loads(payload)
-    return data.get("data", [{}])[0]
+  data = json.loads(payload)
+  return (data.get("data") or [{}])[0]
 
 output_dir = Path(os.environ["OUTPUT_DIR"])
 report_path = output_dir / "postload_validation.json"
 
 report = {
-    "impacted_slice_volume": first_row(os.environ["IMPACTED_VOLUME_JSON"]),
-    "fix_verification": json.loads(os.environ["FIX_VERIFICATION_JSON"]).get("data", []),
-    "tso_postload": {
-        "missing": first_row(os.environ["TSO_MISSING_JSON"]),
-        "nonexistent": first_row(os.environ["TSO_NONEXISTENT_JSON"]),
-        "customer_mismatch": first_row(os.environ["TSO_MISMATCH_JSON"]),
-    },
+  "impacted_slice_volume": first_row(os.environ["IMPACTED_VOLUME_JSON"]),
+  "fix_verification": json.loads(os.environ["FIX_VERIFICATION_JSON"]).get("data", []),
+  "tso_postload": {
+    "missing": first_row(os.environ["TSO_MISSING_JSON"]),
+    "nonexistent": first_row(os.environ["TSO_NONEXISTENT_JSON"]),
+    "customer_mismatch": first_row(os.environ["TSO_MISMATCH_JSON"]),
+  },
 }
 
 report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
